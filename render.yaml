@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: blankroom-backend
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: FRONTEND_URL
+        # Set this to your Vercel frontend URL after deploying:
+        # e.g. https://blankroom.vercel.app
+        value: https://your-vercel-app.vercel.app
