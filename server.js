@@ -111,7 +111,7 @@ const PERMANENT_ROOMS = [
   'sports'
 ];
 
-// Initialize permanent rooms
+// Initialize permanent rooms immediately and ensure they always exist
 PERMANENT_ROOMS.forEach(room => {
   if (!groupRooms.has(room)) {
     groupRooms.set(room, new Set());
@@ -150,7 +150,16 @@ function filterMessage(msg) {
   return out;
 }
 
+// ── FIXED: Always include permanent rooms even if empty ──
 function getActiveRooms() {
+  // First, ensure all permanent rooms exist in the map
+  PERMANENT_ROOMS.forEach(room => {
+    if (!groupRooms.has(room)) {
+      groupRooms.set(room, new Set());
+    }
+  });
+  
+  // Now get all rooms including permanents
   return [...groupRooms.entries()]
     .filter(([name]) => name !== '__none__')
     .map(([name, members]) => ({ 
@@ -191,6 +200,9 @@ io.on('connection', (socket) => {
   
   // Generate a simple session ID without any tracking info
   socket.sessionId = Math.random().toString(36).substring(2, 10);
+  
+  // Send room list immediately on connection
+  socket.emit('rooms_list', getActiveRooms());
   
   const canMsg = createMsgLimiter();
 
@@ -278,13 +290,14 @@ io.on('connection', (socket) => {
       exitRoom(socket);
     }
     
-    // Join new room
-    socket.join(roomName);
-    socket.currentRoom = roomName;
-    
+    // Ensure the room exists in our map (especially for permanent rooms)
     if (!groupRooms.has(roomName)) {
       groupRooms.set(roomName, new Set());
     }
+    
+    // Join new room
+    socket.join(roomName);
+    socket.currentRoom = roomName;
     groupRooms.get(roomName).add(socket.id);
 
     const count = groupRooms.get(roomName).size;
@@ -309,6 +322,7 @@ io.on('connection', (socket) => {
       timestamp: Date.now()
     });
     
+    // Broadcast updated room list to ALL clients
     io.emit('rooms_updated', getActiveRooms());
   });
 
@@ -351,6 +365,9 @@ io.on('connection', (socket) => {
     
     // Leave room if any
     if (socket.currentRoom) exitRoom(socket);
+    
+    // Broadcast updated room list to ALL clients
+    io.emit('rooms_updated', getActiveRooms());
   });
 
   // ── Helpers ──
@@ -384,14 +401,18 @@ io.on('connection', (socket) => {
       if (!PERMANENT_ROOMS.includes(name) && rm.size === 0) {
         groupRooms.delete(name);
       } else {
-        io.to(name).emit('room_message', { 
-          from: 'system', 
-          text: `${sock.nickname || 'Someone'} left.`,
-          timestamp: Date.now()
-        });
+        // Only notify if there are still people in the room
+        if (rm.size > 0) {
+          io.to(name).emit('room_message', { 
+            from: 'system', 
+            text: `${sock.nickname || 'Someone'} left.`,
+            timestamp: Date.now()
+          });
+        }
       }
     }
     
+    // Broadcast updated room list to ALL clients
     io.emit('rooms_updated', getActiveRooms());
   }
 });
@@ -402,4 +423,7 @@ server.listen(PORT, () => {
   console.log(`Permanent rooms: ${PERMANENT_ROOMS.join(', ')}`);
   console.log('CORS: All origins allowed for Instagram/Twitter compatibility');
   console.log('⚠ NO IP LOGGING - Privacy first!');
+  
+  // Verify permanent rooms are initialized
+  console.log('✓ Permanent rooms initialized:', PERMANENT_ROOMS);
 });
