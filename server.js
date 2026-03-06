@@ -23,18 +23,20 @@ const allowedOrigins = [
   FRONTEND_URL,
 ].filter((v, i, a) => v && a.indexOf(v) === i);
 
-// ── SECURITY HEADERS (relaxed for embeds) ──
+// ── SECURITY HEADERS (relaxed for embeds and WebRTC) ──
 app.use(
   helmet({
     contentSecurityPolicy: {
       directives: {
         defaultSrc: ["'self'", '*'],
         scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'", '*'],
-        connectSrc: ["'self'", '*', 'wss:', 'ws:'],
+        connectSrc: ["'self'", '*', 'wss:', 'ws:', 'blob:', 'data:'],
         styleSrc: ["'self'", "'unsafe-inline'", '*'],
         fontSrc: ["'self'", '*'],
-        imgSrc: ["'self'", 'data:', '*'],
+        imgSrc: ["'self'", 'data:', '*', 'blob:'],
         frameSrc: ["'self'", '*'],
+        mediaSrc: ["'self'", '*', 'blob:', 'data:'],
+        workerSrc: ["'self'", '*', 'blob:'],
       },
     },
     crossOriginEmbedderPolicy: false,
@@ -45,7 +47,7 @@ app.use(
 
 // ── CORS (very permissive for Instagram embeds) ──
 const corsOptions = {
-  origin: true, // Allow all origins
+  origin: true,
   methods: ['GET', 'POST', 'OPTIONS'],
   credentials: true,
   allowedHeaders: ['Content-Type', 'Authorization'],
@@ -56,7 +58,7 @@ app.options('*', cors(corsOptions));
 
 // ── HTTP RATE LIMITING ──
 const globalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 min
+  windowMs: 15 * 60 * 1000,
   max: 200,
   standardHeaders: true,
   legacyHeaders: false,
@@ -77,8 +79,10 @@ app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
     connections: io.engine.clientsCount,
-    queue: waitingQueue.length,
-    activePairs: activePairs.size / 2,
+    textQueue: textWaitingQueue.length,
+    videoQueue: videoWaitingQueue.length,
+    activeTextPairs: textPairs.size / 2,
+    activeVideoPairs: videoPairs.size / 2,
     rooms: groupRooms.size,
   });
 });
@@ -86,20 +90,25 @@ app.get('/health', (_req, res) => {
 // ── SOCKET.IO ──
 const io = new Server(server, {
   cors: {
-    origin: true, // Allow all origins
+    origin: true,
     methods: ['GET', 'POST'],
     credentials: true,
   },
   transports: ['websocket', 'polling'],
   pingTimeout: 20000,
   pingInterval: 25000,
-  allowEIO3: true, // Better compatibility
+  allowEIO3: true,
+  maxHttpBufferSize: 1e8, // For large video signaling data
 });
 
 // ── IN-MEMORY STATE ──
-const waitingQueue = [];
-const activePairs = new Map();
+const textWaitingQueue = [];
+const videoWaitingQueue = [];
+const textPairs = new Map();
+const videoPairs = new Map();
 const groupRooms = new Map();
+const userInterests = new Map();
+const videoSettings = new Map(); // Store video/audio preferences
 
 // ── PERMANENT PRE-GROUPS ──
 const PERMANENT_ROOMS = [
@@ -108,10 +117,14 @@ const PERMANENT_ROOMS = [
   'music',
   'gaming',
   'tech',
-  'sports'
+  'sports',
+  'movies',
+  'art',
+  'science',
+  'philosophy'
 ];
 
-// Initialize permanent rooms immediately and ensure they always exist
+// Initialize permanent rooms
 PERMANENT_ROOMS.forEach(room => {
   if (!groupRooms.has(room)) {
     groupRooms.set(room, new Set());
@@ -138,7 +151,8 @@ function createMsgLimiter() {
 // ── PROFANITY FILTER ──
 const badWords = [
   'fuck', 'shit', 'ass', 'bitch', 'dick', 'cock',
-  'cunt', 'faggot', 'nigger', 'whore',
+  'cunt', 'faggot', 'nigger', 'whore', 'pussy',
+  'bastard', 'slut'
 ];
 
 function filterMessage(msg) {
@@ -150,16 +164,13 @@ function filterMessage(msg) {
   return out;
 }
 
-// ── FIXED: Always include permanent rooms even if empty ──
 function getActiveRooms() {
-  // First, ensure all permanent rooms exist in the map
   PERMANENT_ROOMS.forEach(room => {
     if (!groupRooms.has(room)) {
       groupRooms.set(room, new Set());
     }
   });
   
-  // Now get all rooms including permanents
   return [...groupRooms.entries()]
     .filter(([name]) => name !== '__none__')
     .map(([name, members]) => ({ 
@@ -169,68 +180,293 @@ function getActiveRooms() {
     }));
 }
 
-// ── OMEGELE PAIRING ALGORITHM ──
-function findBestMatch(socket) {
-  if (waitingQueue.length === 0) return null;
+// ── ENHANCED MATCHING WITH INTERESTS ──
+function findBestMatch(socket, queue, type = 'text') {
+  if (queue.length === 0) return null;
   
-  // No IP logging - we don't store IPs
-  // Just match based on connection time (oldest first) with some randomization
+  const userInterest = userInterests.get(socket.id) || [];
+  let bestMatchIndex = 0;
+  let bestScore = -1;
   
-  // 80% chance to match with oldest in queue (FIFO)
-  // 20% chance to match randomly to prevent predictability
-  let partnerIndex = 0;
-  
-  if (waitingQueue.length > 1 && Math.random() < 0.2) {
-    // Random matching
-    partnerIndex = Math.floor(Math.random() * waitingQueue.length);
+  for (let i = 0; i < queue.length; i++) {
+    const candidate = queue[i];
+    if (candidate.id === socket.id) continue; // Don't match with self
+    
+    const candidateInterest = userInterests.get(candidate.id) || [];
+    
+    // Calculate interest match score
+    let score = 0;
+    userInterest.forEach(interest => {
+      if (candidateInterest.includes(interest)) score += 2;
+    });
+    
+    // Time in queue bonus
+    const timeInQueue = (Date.now() - (candidate.joinTime || Date.now())) / 1000;
+    score += Math.min(timeInQueue * 0.1, 5); // Max 5 point bonus
+    
+    // Random factor to prevent predictability
+    score += Math.random() * 2;
+    
+    if (score > bestScore) {
+      bestScore = score;
+      bestMatchIndex = i;
+    }
   }
   
-  const partner = waitingQueue[partnerIndex];
-  
-  // Remove from queue
-  waitingQueue.splice(partnerIndex, 1);
+  const partner = queue[bestMatchIndex];
+  queue.splice(bestMatchIndex, 1);
   
   return partner;
 }
 
 // ── SOCKET CONNECTIONS ──
 io.on('connection', (socket) => {
-  // IMPORTANT: No IP logging! We don't store or log IP addresses
   console.log(`[+] ${socket.id} connected`);
   
-  // Generate a simple session ID without any tracking info
   socket.sessionId = Math.random().toString(36).substring(2, 10);
+  socket.joinTime = Date.now();
   
-  // Send room list immediately on connection
+  // Send initial data
   socket.emit('rooms_list', getActiveRooms());
+  socket.emit('server_time', Date.now());
   
   const canMsg = createMsgLimiter();
 
-  // ─── 1v1 with Omegele algorithm ───
-  socket.on('find_stranger', () => {
-    leaveCurrentPair(socket);
+  // ─── INTEREST MATCHING ───
+  socket.on('set_interests', (data) => {
+    const interests = Array.isArray(data.interests) ? data.interests : [];
+    userInterests.set(socket.id, interests.slice(0, 5));
+  });
 
-    const partner = findBestMatch(socket);
+  // ─── VIDEO CHAT HANDLING (OMEGELE STYLE) ───
+
+  // Request camera/mic permissions and start video search
+  socket.on('start_video_chat', async (data) => {
+    const settings = data.settings || { video: true, audio: true };
+    videoSettings.set(socket.id, settings);
+    
+    // Leave any existing video pair
+    leaveCurrentPair(socket, 'video');
+    
+    socket.emit('video_permission_requested', { 
+      message: 'Please allow camera and microphone access',
+      settings 
+    });
+  });
+
+  // User confirmed permissions, start searching
+  socket.on('find_video_stranger', () => {
+    leaveCurrentPair(socket, 'video');
+    
+    // Remove from queue if already there
+    const existingIndex = videoWaitingQueue.findIndex(s => s.id === socket.id);
+    if (existingIndex !== -1) videoWaitingQueue.splice(existingIndex, 1);
+    
+    const partner = findBestMatch(socket, videoWaitingQueue, 'video');
     
     if (partner && partner.connected) {
-      // Pair them
-      activePairs.set(socket.id, partner.id);
-      activePairs.set(partner.id, socket.id);
+      // Create video pair
+      videoPairs.set(socket.id, partner.id);
+      videoPairs.set(partner.id, socket.id);
+      
+      // Get both users' settings
+      const socketSettings = videoSettings.get(socket.id) || { video: true, audio: true };
+      const partnerSettings = videoSettings.get(partner.id) || { video: true, audio: true };
+      
+      // Notify both users
+      socket.emit('video_paired', { 
+        message: 'Video partner found!',
+        initiator: true,
+        settings: partnerSettings,
+        timestamp: Date.now()
+      });
+      
+      partner.emit('video_paired', { 
+        message: 'Video partner found!',
+        initiator: false,
+        settings: socketSettings,
+        timestamp: Date.now()
+      });
+      
+      console.log(`Video pair created: ${socket.id} <-> ${partner.id}`);
+    } else {
+      // Add to queue with timestamp
+      socket.joinTime = Date.now();
+      videoWaitingQueue.push(socket);
+      
+      socket.emit('video_searching', { 
+        message: 'Looking for a video partner...',
+        position: videoWaitingQueue.length,
+        timestamp: Date.now()
+      });
+    }
+  });
+
+  // WebRTC Signaling
+  socket.on('video_offer', (data) => {
+    const partnerId = videoPairs.get(socket.id);
+    if (!partnerId) return;
+    
+    const partner = io.sockets.sockets.get(partnerId);
+    if (!partner) return;
+    
+    partner.emit('video_offer', {
+      offer: data.offer,
+      from: socket.id,
+      timestamp: Date.now()
+    });
+  });
+
+  socket.on('video_answer', (data) => {
+    const partnerId = videoPairs.get(socket.id);
+    if (!partnerId) return;
+    
+    const partner = io.sockets.sockets.get(partnerId);
+    if (!partner) return;
+    
+    partner.emit('video_answer', {
+      answer: data.answer,
+      from: socket.id,
+      timestamp: Date.now()
+    });
+  });
+
+  socket.on('video_ice_candidate', (data) => {
+    const partnerId = videoPairs.get(socket.id);
+    if (!partnerId) return;
+    
+    const partner = io.sockets.sockets.get(partnerId);
+    if (!partner) return;
+    
+    partner.emit('video_ice_candidate', {
+      candidate: data.candidate,
+      from: socket.id,
+      timestamp: Date.now()
+    });
+  });
+
+  // Video controls
+  socket.on('video_toggle_audio', (data) => {
+    const partnerId = videoPairs.get(socket.id);
+    if (!partnerId) return;
+    
+    const partner = io.sockets.sockets.get(partnerId);
+    if (!partner) return;
+    
+    const enabled = data.enabled !== false;
+    partner.emit('video_partner_toggle_audio', { 
+      enabled,
+      timestamp: Date.now()
+    });
+  });
+
+  socket.on('video_toggle_video', (data) => {
+    const partnerId = videoPairs.get(socket.id);
+    if (!partnerId) return;
+    
+    const partner = io.sockets.sockets.get(partnerId);
+    if (!partner) return;
+    
+    const enabled = data.enabled !== false;
+    partner.emit('video_partner_toggle_video', { 
+      enabled,
+      timestamp: Date.now()
+    });
+  });
+
+  // Report inappropriate video behavior
+  socket.on('video_report', (data) => {
+    const partnerId = videoPairs.get(socket.id);
+    if (partnerId) {
+      console.log(`[VIDEO REPORT] User ${socket.id} reported ${partnerId}: ${data.reason}`);
+      
+      // Disconnect the pair
+      const partner = io.sockets.sockets.get(partnerId);
+      if (partner) {
+        partner.emit('video_reported', { 
+          message: 'Your partner has ended the chat due to inappropriate behavior.',
+          timestamp: Date.now()
+        });
+      }
+      
+      // Remove pair
+      videoPairs.delete(socket.id);
+      videoPairs.delete(partnerId);
+      
+      socket.emit('video_report_submitted', { 
+        message: 'Report submitted. Thank you for helping keep the community safe.',
+        timestamp: Date.now()
+      });
+    }
+  });
+
+  // Skip current video partner
+  socket.on('video_skip', () => {
+    const partnerId = videoPairs.get(socket.id);
+    if (partnerId) {
+      const partner = io.sockets.sockets.get(partnerId);
+      if (partner) {
+        partner.emit('video_stranger_skipped', { 
+          message: 'Stranger skipped to next partner',
+          timestamp: Date.now()
+        });
+        videoPairs.delete(partnerId);
+      }
+      videoPairs.delete(socket.id);
+    }
+    
+    // Start searching for new partner
+    socket.emit('find_video_stranger');
+  });
+
+  // End video chat
+  socket.on('video_end', () => {
+    leaveCurrentPair(socket, 'video');
+    socket.emit('video_ended', { 
+      message: 'Video chat ended',
+      timestamp: Date.now()
+    });
+  });
+
+  // ─── TEXT 1v1 CHAT ───
+  socket.on('find_stranger', () => {
+    leaveCurrentPair(socket, 'text');
+
+    const partner = findBestMatch(socket, textWaitingQueue, 'text');
+    
+    if (partner && partner.connected) {
+      textPairs.set(socket.id, partner.id);
+      textPairs.set(partner.id, socket.id);
+      
+      const myInterests = userInterests.get(socket.id) || [];
+      const theirInterests = userInterests.get(partner.id) || [];
+      const commonInterests = myInterests.filter(i => theirInterests.includes(i));
       
       socket.emit('paired', { 
-        message: 'You are now chatting with a stranger.',
-        timestamp: Date.now()
+        type: 'text',
+        message: commonInterests.length > 0 
+          ? `Matched! Common interests: ${commonInterests.join(', ')}`
+          : 'You are now chatting with a stranger.',
+        timestamp: Date.now(),
+        commonInterests
       });
       
       partner.emit('paired', { 
-        message: 'You are now chatting with a stranger.',
-        timestamp: Date.now()
+        type: 'text',
+        message: commonInterests.length > 0 
+          ? `Matched! Common interests: ${commonInterests.join(', ')}`
+          : 'You are now chatting with a stranger.',
+        timestamp: Date.now(),
+        commonInterests
       });
     } else {
-      waitingQueue.push(socket);
+      socket.joinTime = Date.now();
+      textWaitingQueue.push(socket);
       socket.emit('searching', { 
+        type: 'text',
         message: 'Looking for someone to chat with...',
-        position: waitingQueue.length
+        position: textWaitingQueue.length,
+        timestamp: Date.now()
       });
     }
   });
@@ -241,38 +477,52 @@ io.on('connection', (socket) => {
       return; 
     }
     
-    const partnerId = activePairs.get(socket.id);
+    const partnerId = textPairs.get(socket.id);
     if (!partnerId) return;
     
     const partner = io.sockets.sockets.get(partnerId);
     if (!partner) return;
     
     const msg = filterMessage(data.message);
+    const messageId = Date.now() + '-' + Math.random().toString(36).substr(2, 9);
+    
     partner.emit('message_1v1', { 
       from: 'stranger', 
       text: msg,
+      messageId,
       timestamp: Date.now()
     });
     
     socket.emit('message_1v1', { 
       from: 'you', 
       text: msg,
+      messageId,
       timestamp: Date.now()
     });
   });
 
-  socket.on('skip_stranger', () => {
-    // Skip current and find new one immediately
-    leaveCurrentPair(socket);
-    socket.emit('find_stranger');
+  // ─── TYPING INDICATOR ───
+  socket.on('typing', (data) => {
+    const { isTyping, chatType } = data;
+    
+    if (chatType === '1v1') {
+      const partnerId = textPairs.get(socket.id);
+      if (partnerId) {
+        const partner = io.sockets.sockets.get(partnerId);
+        if (partner) {
+          partner.emit('partner_typing', { isTyping });
+        }
+      }
+    } else if (chatType === 'group' && socket.currentRoom) {
+      socket.to(socket.currentRoom).emit('room_typing', {
+        userId: socket.id,
+        nickname: socket.nickname || 'Someone',
+        isTyping
+      });
+    }
   });
 
-  socket.on('end_chat', () => {
-    leaveCurrentPair(socket);
-    socket.emit('chat_ended');
-  });
-
-  // ─── Group with permanent rooms ───
+  // ─── GROUP CHAT ───
   socket.on('get_rooms', () => {
     socket.emit('rooms_list', getActiveRooms());
   });
@@ -280,50 +530,49 @@ io.on('connection', (socket) => {
   socket.on('join_room', (data) => {
     let roomName = String(data.room || '').trim().slice(0, 30);
     
-    // If no room name provided or invalid, put in general
     if (!roomName || roomName === '__none__') {
       roomName = 'general';
     }
     
-    // Leave current room if any
     if (socket.currentRoom) {
-      exitRoom(socket);
+      exitRoom(socket, true);
     }
     
-    // Ensure the room exists in our map (especially for permanent rooms)
-    if (!groupRooms.has(roomName)) {
-      groupRooms.set(roomName, new Set());
-    }
-    
-    // Join new room
-    socket.join(roomName);
-    socket.currentRoom = roomName;
-    groupRooms.get(roomName).add(socket.id);
-
-    const count = groupRooms.get(roomName).size;
-    
-    socket.emit('room_joined', { 
-      room: roomName, 
-      count,
-      permanent: PERMANENT_ROOMS.includes(roomName)
-    });
-    
-    // Welcome message
-    socket.emit('room_message', {
-      from: 'system',
-      text: `Welcome to #${roomName}! There ${count === 1 ? 'is' : 'are'} ${count} user${count === 1 ? '' : 's'} here.`,
-      timestamp: Date.now()
-    });
-    
-    // Notify others
-    socket.to(roomName).emit('room_message', {
-      from: 'system',
-      text: `${socket.nickname || 'Someone'} joined. (${count} in room)`,
-      timestamp: Date.now()
-    });
-    
-    // Broadcast updated room list to ALL clients
-    io.emit('rooms_updated', getActiveRooms());
+    setTimeout(() => {
+      if (!groupRooms.has(roomName)) {
+        groupRooms.set(roomName, new Set());
+      }
+      
+      socket.join(roomName);
+      socket.currentRoom = roomName;
+      groupRooms.get(roomName).add(socket.id);
+      
+      const count = groupRooms.get(roomName).size;
+      
+      socket.emit('room_joined', { 
+        room: roomName, 
+        count,
+        permanent: PERMANENT_ROOMS.includes(roomName)
+      });
+      
+      setTimeout(() => {
+        socket.emit('room_message', {
+          from: 'system',
+          text: `✨ Welcome to #${roomName}! There ${count === 1 ? 'is' : 'are'} ${count} user${count === 1 ? '' : 's'} here.`,
+          timestamp: Date.now(),
+          type: 'welcome'
+        });
+      }, 100);
+      
+      socket.to(roomName).emit('room_message', {
+        from: 'system',
+        text: `🌸 ${socket.nickname || 'Someone'} joined. (${count} in room)`,
+        timestamp: Date.now(),
+        type: 'join'
+      });
+      
+      io.emit('rooms_updated', getActiveRooms());
+    }, 300);
   });
 
   socket.on('send_message_group', (data) => {
@@ -334,96 +583,150 @@ io.on('connection', (socket) => {
     }
     
     const msg = filterMessage(data.message);
+    const messageId = Date.now() + '-' + Math.random().toString(36).substr(2, 9);
     
     io.to(socket.currentRoom).emit('room_message', {
       from: socket.nickname || 'Stranger',
       text: msg,
       selfId: socket.id,
+      messageId,
       timestamp: Date.now()
     });
+  });
+
+  socket.on('leave_room', (data) => {
+    const smooth = data?.smooth !== false;
+    exitRoom(socket, smooth);
   });
 
   socket.on('set_nickname', (data) => {
     socket.nickname = String(data.nickname || '').slice(0, 20) || 'Stranger';
   });
 
+  // ─── REPORT USER ───
   socket.on('report_user', (data) => {
-    // Log without any identifying info
-    console.log(`[REPORT] Reason: ${data.reason || 'none'}`);
-    socket.emit('report_received', { message: 'Report submitted. Thank you.' });
+    console.log(`[REPORT] ${socket.id} reported: ${data.reason}`);
+    socket.emit('report_received', { 
+      message: 'Report submitted. Thank you for helping keep the community safe.',
+      timestamp: Date.now()
+    });
   });
 
+  // ─── DISCONNECT ───
   socket.on('disconnect', () => {
     console.log(`[-] ${socket.id} disconnected`);
     
-    // Remove from queue
-    const qi = waitingQueue.indexOf(socket);
-    if (qi !== -1) waitingQueue.splice(qi, 1);
+    // Remove from queues
+    const textIndex = textWaitingQueue.findIndex(s => s.id === socket.id);
+    if (textIndex !== -1) textWaitingQueue.splice(textIndex, 1);
     
-    // Leave pair if any
-    leaveCurrentPair(socket);
+    const videoIndex = videoWaitingQueue.findIndex(s => s.id === socket.id);
+    if (videoIndex !== -1) videoWaitingQueue.splice(videoIndex, 1);
     
-    // Leave room if any
-    if (socket.currentRoom) exitRoom(socket);
+    // Clean up interests and settings
+    userInterests.delete(socket.id);
+    videoSettings.delete(socket.id);
     
-    // Broadcast updated room list to ALL clients
+    // Leave pairs
+    leaveCurrentPair(socket, 'text');
+    leaveCurrentPair(socket, 'video');
+    
+    // Leave room
+    if (socket.currentRoom) exitRoom(socket, false);
+    
     io.emit('rooms_updated', getActiveRooms());
   });
 
-  // ── Helpers ──
-  function leaveCurrentPair(sock) {
-    const partnerId = activePairs.get(sock.id);
-    if (partnerId) {
-      const partner = io.sockets.sockets.get(partnerId);
-      if (partner && partner.connected) { 
-        partner.emit('stranger_left'); 
-        activePairs.delete(partnerId);
+  // ── HELPERS ──
+  function leaveCurrentPair(sock, type) {
+    if (type === 'video') {
+      const partnerId = videoPairs.get(sock.id);
+      if (partnerId) {
+        const partner = io.sockets.sockets.get(partnerId);
+        if (partner && partner.connected) { 
+          partner.emit('video_stranger_left', { 
+            message: 'Stranger disconnected.',
+            timestamp: Date.now()
+          }); 
+          videoPairs.delete(partnerId);
+        }
+        videoPairs.delete(sock.id);
       }
-      activePairs.delete(sock.id);
+      
+      // Remove from video queue if present
+      const videoIndex = videoWaitingQueue.findIndex(s => s.id === sock.id);
+      if (videoIndex !== -1) videoWaitingQueue.splice(videoIndex, 1);
+      
+    } else {
+      const partnerId = textPairs.get(sock.id);
+      if (partnerId) {
+        const partner = io.sockets.sockets.get(partnerId);
+        if (partner && partner.connected) { 
+          partner.emit('stranger_left', { 
+            message: 'Stranger disconnected.',
+            timestamp: Date.now()
+          }); 
+          textPairs.delete(partnerId);
+        }
+        textPairs.delete(sock.id);
+      }
+      
+      const textIndex = textWaitingQueue.findIndex(s => s.id === sock.id);
+      if (textIndex !== -1) textWaitingQueue.splice(textIndex, 1);
     }
-    
-    const qi = waitingQueue.indexOf(sock);
-    if (qi !== -1) waitingQueue.splice(qi, 1);
   }
 
-  function exitRoom(sock) {
+  function exitRoom(sock, smooth = true) {
     const name = sock.currentRoom;
     if (!name) return;
     
-    sock.leave(name);
-    sock.currentRoom = null;
-    
-    const rm = groupRooms.get(name);
-    if (rm) {
-      rm.delete(sock.id);
-      
-      // Don't delete permanent rooms even if empty
-      if (!PERMANENT_ROOMS.includes(name) && rm.size === 0) {
-        groupRooms.delete(name);
-      } else {
-        // Only notify if there are still people in the room
-        if (rm.size > 0) {
-          io.to(name).emit('room_message', { 
-            from: 'system', 
-            text: `${sock.nickname || 'Someone'} left.`,
-            timestamp: Date.now()
-          });
-        }
-      }
+    if (smooth) {
+      io.to(name).emit('room_message', { 
+        from: 'system', 
+        text: `👋 ${sock.nickname || 'Someone'} is leaving...`,
+        timestamp: Date.now(),
+        type: 'leave-pending'
+      });
     }
     
-    // Broadcast updated room list to ALL clients
-    io.emit('rooms_updated', getActiveRooms());
+    setTimeout(() => {
+      sock.leave(name);
+      sock.currentRoom = null;
+      
+      const rm = groupRooms.get(name);
+      if (rm) {
+        rm.delete(sock.id);
+        
+        if (!PERMANENT_ROOMS.includes(name) && rm.size === 0) {
+          groupRooms.delete(name);
+        } else {
+          if (rm.size > 0) {
+            io.to(name).emit('room_message', { 
+              from: 'system', 
+              text: `🍃 ${sock.nickname || 'Someone'} left.`,
+              timestamp: Date.now(),
+              type: 'leave'
+            });
+          }
+        }
+      }
+      
+      sock.emit('room_left', { 
+        room: name,
+        message: `You left #${name}`,
+        timestamp: Date.now()
+      });
+      
+      io.emit('rooms_updated', getActiveRooms());
+    }, smooth ? 300 : 0);
   }
 });
 
 // ── START ──
 server.listen(PORT, () => {
-  console.log(`BlankRoom [${NODE_ENV}] on port ${PORT}`);
-  console.log(`Permanent rooms: ${PERMANENT_ROOMS.join(', ')}`);
-  console.log('CORS: All origins allowed for Instagram/Twitter compatibility');
-  console.log('⚠ NO IP LOGGING - Privacy first!');
-  
-  // Verify permanent rooms are initialized
-  console.log('✓ Permanent rooms initialized:', PERMANENT_ROOMS);
+  console.log(`\n✨ BlankRoom [${NODE_ENV}] on port ${PORT}`);
+  console.log(`📌 Permanent rooms: ${PERMANENT_ROOMS.join(', ')}`);
+  console.log(`🎥 Video chat enabled (Omegle style)`);
+  console.log(`🌐 CORS: All origins allowed`);
+  console.log(`🔒 NO IP LOGGING - Privacy first!\n`);
 });
